@@ -972,6 +972,70 @@ class ExpressionEditor:
 
         return {"ui": {"images": results}, "result": (out_img, new_editor_link, es)}
 
+import json
+import urllib.request
+import tempfile
+
+_FACE_LANDMARKER_MODEL_PATH = os.path.join(current_directory, "models", "face_landmarker.task")
+_FACE_LANDMARKER_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+
+def _ensure_face_landmarker_model():
+    if not os.path.exists(_FACE_LANDMARKER_MODEL_PATH):
+        os.makedirs(os.path.dirname(_FACE_LANDMARKER_MODEL_PATH), exist_ok=True)
+        print(f"[FaceBlendshapes] Downloading face_landmarker.task model...")
+        urllib.request.urlretrieve(_FACE_LANDMARKER_MODEL_URL, _FACE_LANDMARKER_MODEL_PATH)
+        print(f"[FaceBlendshapes] Model saved to {_FACE_LANDMARKER_MODEL_PATH}")
+
+class FaceBlendshapes:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("blendshapes_json",)
+    FUNCTION = "run"
+    CATEGORY = "AdvancedLivePortrait"
+
+    def run(self, image):
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks.python import vision as mp_vision
+            from mediapipe.tasks.python.core import base_options as mp_base_options
+        except ImportError:
+            raise RuntimeError(
+                "[FaceBlendshapes] mediapipe is not installed. "
+                "Please run: pip install mediapipe"
+            )
+
+        _ensure_face_landmarker_model()
+
+        # Only process the first image in the batch
+        # image shape: [B, H, W, C], float32 0-1
+        img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_np)
+
+        base_opts = mp_base_options.BaseOptions(model_asset_path=_FACE_LANDMARKER_MODEL_PATH)
+        options = mp_vision.FaceLandmarkerOptions(
+            base_options=base_opts,
+            output_face_blendshapes=True,
+            num_faces=1,
+        )
+        with mp_vision.FaceLandmarker.create_from_options(options) as detector:
+            result = detector.detect(mp_image)
+
+        if not result.face_blendshapes:
+            return (json.dumps({"error": "No face detected"}, indent=2),)
+
+        blendshapes = result.face_blendshapes[0]
+        data = {bs.category_name: round(bs.score, 6) for bs in blendshapes}
+        return (json.dumps(data, indent=2),)
+
+
 NODE_CLASS_MAPPINGS = {
     "AdvancedLivePortrait": AdvancedLivePortrait,
     "ExpressionEditor": ExpressionEditor,
@@ -979,11 +1043,13 @@ NODE_CLASS_MAPPINGS = {
     "SaveExpData": SaveExpData,
     "ExpData": ExpData,
     "PrintExpData:": PrintExpData,
+    "FaceBlendshapes": FaceBlendshapes,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedLivePortrait": "Advanced Live Portrait (PHM)",
     "ExpressionEditor": "Expression Editor (PHM)",
     "LoadExpData": "Load Exp Data (PHM)",
-    "SaveExpData": "Save Exp Data (PHM)"
+    "SaveExpData": "Save Exp Data (PHM)",
+    "FaceBlendshapes": "Face Blendshapes (PHM)",
 }
