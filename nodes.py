@@ -976,6 +976,219 @@ import json
 import urllib.request
 import tempfile
 
+# ---------------------------------------------------------------------------
+# Valid expression names for AddExpressionToVideo / ExpressionEditor
+# ---------------------------------------------------------------------------
+VALID_EXPRESSIONS = {
+    'blink', 'eyebrow', 'wink_left', 'wink_right',
+    'pupil_x', 'pupil_y',
+    'aaa', 'eee', 'woo', 'smile',
+    'rotate_pitch', 'rotate_yaw', 'rotate_roll',
+}
+
+_EXPRESSION_HELP = """\
+Available expressions and their typical value ranges
+(same as Expression Editor node):
+
+  blink        : both eyes open/close     (-20 ~ 5,   negative = wide open)
+  eyebrow      : raise / lower eyebrows   (-10 ~ 15)
+  wink_left    : close left eye            (0  ~ 25)
+  wink_right   : close right eye           (0  ~ 25)
+  pupil_x      : pupil horizontal          (-15 ~ 15)
+  pupil_y      : pupil vertical            (-15 ~ 15)
+  aaa          : mouth open / "aaa"        (-30 ~ 120)
+  eee          : "eee" mouth shape         (-20 ~ 15)
+  woo          : "woo" round mouth         (-20 ~ 15)
+  smile        : smile intensity           (-0.3 ~ 1.3)
+  rotate_pitch : head nod up/down          (-20 ~ 20)
+  rotate_yaw   : head turn left/right      (-20 ~ 20)
+  rotate_roll  : head tilt                 (-20 ~ 20)
+
+Config format (one rule per line):
+  expression|start|max|duration|gradient
+
+  expression : one of the names above
+  start      : frame index where the expression begins (0-based)
+  max        : peak value (can be negative)
+  duration   : frames to hold at peak value
+  gradient   : frames for fade-in and fade-out each
+
+Example:
+  smile|10|1.0|30|15
+  blink|60|-18|4|3
+"""
+
+
+class AddExpressionToVideo:
+    DESCRIPTION = _EXPRESSION_HELP
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "expression_config": ("STRING", {
+                    "multiline": True,
+                    "default": (
+                        "# expression|start|max|duration|gradient\n"
+                        "# Available: blink, eyebrow, wink_left, wink_right,\n"
+                        "#            pupil_x, pupil_y, aaa, eee, woo, smile,\n"
+                        "#            rotate_pitch, rotate_yaw, rotate_roll\n"
+                        "smile|0|1.0|30|15"
+                    ),
+                    "tooltip": _EXPRESSION_HELP,
+                }),
+                "crop_factor": ("FLOAT", {
+                    "default": 1.7, "min": 1.5, "max": 2.5, "step": 0.1,
+                }),
+                "src_ratio": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "run"
+    CATEGORY = "AdvancedLivePortrait"
+
+    # ------------------------------------------------------------------
+    # Config parsing
+    # ------------------------------------------------------------------
+    def _parse_config(self, text):
+        entries = []
+        for line_no, raw in enumerate(text.split('\n'), 1):
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) != 5:
+                raise ValueError(
+                    f"Line {line_no}: expected 5 fields separated by '|', "
+                    f"got {len(parts)}: {line!r}"
+                )
+            expr, start, max_val, duration, gradient = parts
+            if expr not in VALID_EXPRESSIONS:
+                raise ValueError(
+                    f"Line {line_no}: unknown expression {expr!r}.\n"
+                    f"Valid names: {sorted(VALID_EXPRESSIONS)}"
+                )
+            entries.append({
+                'expression': expr,
+                'start':    int(start),
+                'max':      float(max_val),
+                'duration': int(duration),
+                'gradient': int(gradient),
+            })
+        return entries
+
+    # ------------------------------------------------------------------
+    # Envelope: value for a single frame
+    # ------------------------------------------------------------------
+    def _frame_value(self, entry, frame_idx):
+        start    = entry['start']
+        max_val  = entry['max']
+        duration = entry['duration']
+        gradient = entry['gradient']
+        end = start + 2 * gradient + duration
+
+        if frame_idx < start or frame_idx >= end:
+            return 0.0
+        rel = frame_idx - start
+        if gradient > 0 and rel < gradient:
+            return max_val * rel / gradient
+        if rel < gradient + duration:
+            return max_val
+        # ramp-down phase
+        remaining = end - frame_idx
+        return (max_val * remaining / gradient) if gradient > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    # Render one frame with a dict of expression values applied
+    # ------------------------------------------------------------------
+    def _render_frame(self, psi, values, pipeline, src_ratio):
+        s_info = psi.x_s_info
+
+        s_exp = s_info['exp'] * src_ratio
+        s_exp[0, 5] = s_info['exp'][0, 5]
+        s_exp += s_info['kp']
+
+        es = ExpressionSet()
+
+        # rotate_yaw is flipped in ExpressionEditor too
+        rotate_yaw = -values.get('rotate_yaw', 0.0)
+
+        es.r = g_engine.calc_fe(
+            es.e,
+            values.get('blink',        0.0),
+            values.get('eyebrow',      0.0),
+            values.get('wink_left',    0.0),
+            values.get('wink_right',   0.0),
+            values.get('pupil_x',      0.0),
+            values.get('pupil_y',      0.0),
+            values.get('aaa',          0.0),
+            values.get('eee',          0.0),
+            values.get('woo',          0.0),
+            values.get('smile',        0.0),
+            values.get('rotate_pitch', 0.0),
+            rotate_yaw,
+            values.get('rotate_roll',  0.0),
+        )
+
+        new_rotate = get_rotation_matrix(
+            s_info['pitch'] + es.r[0],
+            s_info['yaw']   + es.r[1],
+            s_info['roll']  + es.r[2],
+        )
+        x_d_new = (s_info['scale'] * (1 + es.s)) * ((s_exp + es.e) @ new_rotate) + s_info['t']
+        x_d_new = pipeline.stitching(psi.x_s_user, x_d_new)
+        crop_out = pipeline.warp_decode(psi.f_s_user, psi.x_s_user, x_d_new)
+        crop_out = pipeline.parse_output(crop_out['out'])[0]
+
+        crop_with_fullsize = cv2.warpAffine(
+            crop_out, psi.crop_trans_m, get_rgb_size(psi.src_rgb), cv2.INTER_LINEAR
+        )
+        out = np.clip(
+            psi.mask_ori * crop_with_fullsize + (1 - psi.mask_ori) * psi.src_rgb,
+            0, 255,
+        ).astype(np.uint8)
+        return out
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+    def run(self, images, expression_config, crop_factor, src_ratio):
+        entries = self._parse_config(expression_config)
+        num_frames = len(images)
+
+        # Build per-frame expression value map
+        frame_values = {}  # {frame_idx: {expr_name: cumulative_value}}
+        for entry in entries:
+            start = entry['start']
+            end   = start + 2 * entry['gradient'] + entry['duration']
+            for f in range(start, min(end, num_frames)):
+                val = self._frame_value(entry, f)
+                if val != 0.0:
+                    fv = frame_values.setdefault(f, {})
+                    fv[entry['expression']] = fv.get(entry['expression'], 0.0) + val
+
+        if not frame_values:
+            return (images,)
+
+        pipeline = g_engine.get_pipeline()
+        out_tensors = []
+
+        for i in range(num_frames):
+            if i not in frame_values:
+                out_tensors.append(images[i:i+1])
+                continue
+
+            psi     = g_engine.prepare_source(images[i:i+1], crop_factor)
+            out_np  = self._render_frame(psi, frame_values[i], pipeline, src_ratio)
+            out_tensors.append(pil2tensor(out_np))
+
+        return (torch.cat(out_tensors),)
+
 _FACE_LANDMARKER_MODEL_PATH = os.path.join(current_directory, "models", "face_landmarker.task")
 _FACE_LANDMARKER_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 
@@ -1044,6 +1257,7 @@ NODE_CLASS_MAPPINGS = {
     "ExpData": ExpData,
     "PrintExpData:": PrintExpData,
     "FaceBlendshapes": FaceBlendshapes,
+    "AddExpressionToVideo": AddExpressionToVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1052,4 +1266,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadExpData": "Load Exp Data (PHM)",
     "SaveExpData": "Save Exp Data (PHM)",
     "FaceBlendshapes": "Face Blendshapes (PHM)",
+    "AddExpressionToVideo": "Add Expression to Video (PHM)",
 }
